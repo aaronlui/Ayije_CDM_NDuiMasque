@@ -1,0 +1,9 @@
+## Interface: 120001, 120000
+## Title: Ayije_CDM NDui Masque
+## Notes: NDui and Masque bridge for Ayije_CDM
+## Author: Codex
+## Version: 1.0.0
+## RequiredDeps: Ayije_CDM
+## OptionalDeps: NDui, Masque, Blizzard_CooldownViewer
+
+Init.lua
