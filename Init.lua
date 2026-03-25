@@ -1,8 +1,19 @@
+--[[
+    Ayije_CDM + NDui + Masque 桥接插件
+
+    作用简述：
+    1. 当启用 NDui 的 CooldownMgr 皮肤时，用 NDui 的方式重绘 CDM 的图标/冷却，并隐藏 CDM 自带边框。
+    2. 当启用 Masque 时，把 CDM 的各类按钮交给 Masque 分组美化（此时会关掉 NDui 背景以不冲突）。
+    3. 若两者都未按上述方式启用，则尝试恢复 CDM 默认外观。
+
+    通过 hook CDM 创建图标、刷新布局、样式刷新等时机，扫描框体并维护「每个按钮对应一条 entry」的映射。
+]]
 local CDM = _G.Ayije_CDM
 if not CDM then
     return
 end
 
+-- 局部引用 WoW API，略微加速且避免外部改掉全局
 local C_Timer = C_Timer
 local hooksecurefunc = hooksecurefunc
 local ipairs = ipairs
@@ -11,7 +22,9 @@ local pairs = pairs
 local type = type
 local unpack = unpack
 
+-- CDM 内置的「监视器」全局名（Essential / Buff 等），来自 Ayije_CDM 常量
 local VIEWERS = CDM.CONST and CDM.CONST.VIEWERS or {}
+-- 监视器 → Masque 里显示的分组名称
 local VIEWER_GROUPS = {
     [VIEWERS.ESSENTIAL] = "Essential",
     [VIEWERS.UTILITY] = "Utility",
@@ -24,17 +37,23 @@ local TRACKER_CONTAINERS = {
     "CDM_TrinketsContainer",
 }
 
+-- button 帧 → 本插件维护的 entry（弱键：按钮销毁后表项可被 GC）
 local entriesByButton = setmetatable({}, { __mode = "k" })
+-- Masque 分组名 → Masque Group 对象
 local masqueGroups = {}
+-- Masque Group → 属于该组的 entry 集合（弱键，同上）
 local masqueGroupEntries = setmetatable({}, { __mode = "k" })
 local hookedViewers = {}
 local queuedViewerScans = {}
+-- 避免同一帧内重复排队扫描自定义 Buff
 local customBuffScanQueued = false
 
+-- NDui 解包：B=工具/皮肤函数，C=配置模块，DB=全局设置表
 local NDuiB, NDuiC, NDuiDB
 local Masque
 local GetMasqueGroup
 
+-- 按需拉取 NDui（全局表 NDui）与 Masque（LibStub），晚加载也能补上
 local function RefreshIntegrations()
     if not NDuiB then
         local ndui = _G.NDui
@@ -48,6 +67,7 @@ local function RefreshIntegrations()
     end
 end
 
+-- NDui 是否对本插件生效：需要 Skin 里打开了 CooldownMgr
 local function IsNDuiSkinEnabled()
     RefreshIntegrations()
     return NDuiB and NDuiC and NDuiDB
@@ -55,11 +75,13 @@ local function IsNDuiSkinEnabled()
         and NDuiC.db.Skins.CooldownMgr
 end
 
+-- 该 entry 对应的 Masque 分组未被用户禁用
 local function IsMasqueEnabled(entry)
     local group = entry and entry.masqueGroup
     return group and group.db and not group.db.Disabled
 end
 
+-- 有的框体没有标准 Icon 子区域，就找第一个 Texture 子层当代替
 local function FindFirstTextureRegion(frame)
     if not (frame and frame.GetRegions) then
         return nil
@@ -74,6 +96,7 @@ local function FindFirstTextureRegion(frame)
     end
 end
 
+-- 把 region 贴在 anchor 内侧（有 SetInside 用 NDui/Elv 风格，否则手动四角对齐）
 local function SetInside(region, anchor, xOffset, yOffset)
     if not (region and anchor) then
         return
@@ -112,6 +135,7 @@ local function HidePixelStore(store)
     end
 end
 
+-- 隐藏 CDM/Ayije 自带的各类边框与像素边，避免和 NDui/Masque 叠两层
 local function HideAyijeBorders(entry)
     local frame = entry and entry.frame
     if not frame then
@@ -132,6 +156,7 @@ local function HideAyijeBorders(entry)
     HideRegion(frame.pixelIconBorderFrame)
 end
 
+-- 监视器图标上有时多出一两层装饰纹理，NDui 重画前可先藏掉以免漏边
 local function HideIconAuxRegions(owner, iconTexture)
     if not (owner and owner.GetRegions) then
         return
@@ -146,6 +171,7 @@ local function HideIconAuxRegions(owner, iconTexture)
     end
 end
 
+-- 为图标创建/复用 NDui ReskinIcon 的背景，并把图标与冷却置于其内
 local function EnsureNDuiBackdrop(entry, iconOwner, inset)
     if not IsNDuiSkinEnabled() or not entry.iconTexture then
         return nil
@@ -187,6 +213,7 @@ local function EnsureNDuiBackdrop(entry, iconOwner, inset)
     return bg
 end
 
+-- 三种入口形态：追踪条、普通监视器格、自定义 Buff（细节略有不同）
 local function ApplyNDuiTracker(entry)
     local bg = EnsureNDuiBackdrop(entry, entry.button, 2)
     if bg then
@@ -212,6 +239,7 @@ local function ApplyNDuiCustomBuff(entry)
     HideAyijeBorders(entry)
 end
 
+-- 关掉本插件效果时，分别调用 CDM 原版的样式应用函数复原
 local function RestoreTrackerDefault(entry)
     if CDM.ApplyTrackerStyle and entry.viewerName then
         CDM:ApplyTrackerStyle(entry.frame, entry.viewerName, true)
@@ -260,6 +288,10 @@ local function RestoreCustomBuffDefault(entry)
     end
 end
 
+--[[
+    核心分发：每个「按钮 + 元数据」entry 最终长什么样
+    优先级：Masque 开启 > NDui CooldownMgr 皮肤 > 恢复 CDM 默认
+]]
 local function UpdateEntryAppearance(entry)
     if not (entry and entry.button and entry.button.GetObjectType) then
         return
@@ -298,6 +330,7 @@ local function UpdateEntryAppearance(entry)
     end
 end
 
+-- Masque 分组禁用/重置时，刷新该组内所有 CDM 按钮外观
 local function OnMasqueGroupChanged(group)
     local groupSet = masqueGroupEntries[group]
     if not groupSet then
@@ -309,6 +342,7 @@ local function OnMasqueGroupChanged(group)
     end
 end
 
+-- 在 Masque 里创建/缓存名为 "Ayije_CDM" 插件下的子分组，并监听禁用与重置
 GetMasqueGroup = function(groupName)
     RefreshIntegrations()
     if not Masque then
@@ -328,6 +362,7 @@ GetMasqueGroup = function(groupName)
     return group
 end
 
+-- 把按钮加入对应 Masque 分组（regions 告诉 Masque 哪个是图标/冷却/层数等）
 local function RegisterMasqueEntry(entry)
     local group = GetMasqueGroup(entry.groupName)
     if not group then
@@ -345,6 +380,7 @@ local function RegisterMasqueEntry(entry)
     entry.masqueAdded = true
 end
 
+-- 合并同一按钮上多次 Build* 的字段，然后注册 Masque 并刷新外观
 local function RegisterEntry(button, entry)
     if not button then
         return
@@ -364,6 +400,7 @@ local function RegisterEntry(button, entry)
     UpdateEntryAppearance(entry)
 end
 
+-- 种族/减伤/饰品追踪图标：根据框体命名分到不同 Masque 组
 local function BuildTrackerEntry(frame)
     if not (frame and frame.Icon) then
         return
@@ -402,6 +439,7 @@ local function BuildTrackerEntry(frame)
     })
 end
 
+-- 普通冷却监视器单元格（Essential / Utility / Buff 等）
 local function BuildViewerEntry(frame, viewerName)
     if not frame then
         return
@@ -436,6 +474,7 @@ local function BuildViewerEntry(frame, viewerName)
     })
 end
 
+-- Buff 条样式：真正的「按钮」是 frame.Icon，与上面 BuildViewerEntry 结构不同
 local function BuildBuffBarEntry(frame, viewerName)
     if not (frame and frame.Icon and frame.Icon.GetRegions) then
         return
@@ -469,6 +508,7 @@ local function BuildBuffBarEntry(frame, viewerName)
     })
 end
 
+-- 用户自定义 Buff 列表里的单项
 local function BuildCustomBuffEntry(frame)
     if not (frame and frame.Icon) then
         return
@@ -490,6 +530,7 @@ local function BuildCustomBuffEntry(frame)
     })
 end
 
+-- 遍历该监视器对象池里当前激活的所有格子并 Build*
 local function ProcessViewer(viewerName)
     local viewer = _G[viewerName]
     if not (viewer and viewer.itemFramePool) then
@@ -505,6 +546,7 @@ local function ProcessViewer(viewerName)
     end
 end
 
+-- 对已存在的三个追踪容器做一遍子控件扫描（重载/UI 已创建时）
 local function ScanTrackerContainers()
     for _, containerName in ipairs(TRACKER_CONTAINERS) do
         local container = _G[containerName]
@@ -517,6 +559,7 @@ local function ScanTrackerContainers()
     end
 end
 
+-- 延迟到下一帧再扫，避免在布局中途反复 Enumerate 造成抖动或漏项
 local function QueueViewerScan(viewerName)
     if queuedViewerScans[viewerName] then
         return
@@ -529,6 +572,7 @@ local function QueueViewerScan(viewerName)
     end)
 end
 
+-- 自定义 Buff 列表更新后由 CDM 触发，同样防抖用 C_Timer.After(0)
 local function QueueCustomBuffScan()
     if customBuffScanQueued then
         return
@@ -553,6 +597,7 @@ local function QueueCustomBuffScan()
     end)
 end
 
+-- 监视器布局刷新或池子 Acquire 新格子时再排队扫描一次
 local function HookViewer(viewerName)
     if not viewerName or hookedViewers[viewerName] then
         return
@@ -587,6 +632,7 @@ local function HookViewers()
     HookViewer(VIEWERS.BUFF_BAR)
 end
 
+-- CDM 新建追踪图标时立刻包一层，保证新图标也被桥接
 local function HookTrackerFactory()
     if CDM._AyijeNDuiMasqueCreateTrackerHooked or not CDM.CreateTrackerIcon then
         return
@@ -602,6 +648,7 @@ local function HookTrackerFactory()
     end
 end
 
+-- 每次 CDM 汇总自定义 Buff 框体列表时顺带注册
 local function HookCustomBuffFrames()
     if CDM._AyijeNDuiMasqueCustomBuffHooked or not CDM.GetSortedCustomBuffFrames then
         return
@@ -621,6 +668,7 @@ local function HookCustomBuffFrames()
     end
 end
 
+-- CDM 自己改样式或排队监视器后，再应用本桥接逻辑（bridgeUpdating 防止递归）
 local function HookStyleRefreshes()
     if CDM._AyijeNDuiMasqueStyleHooks then
         return
@@ -669,6 +717,7 @@ local function HookStyleRefreshes()
     end
 end
 
+-- 向 CDM 注册低优先级刷新回调：统一再扫一遍并刷新所有已登记 entry
 local function RegisterRefreshCallback()
     if CDM._AyijeNDuiMasqueRefreshRegistered or not CDM.RegisterRefreshCallback then
         return
@@ -692,6 +741,7 @@ local function RegisterRefreshCallback()
     end, 200)
 end
 
+-- 启动时：打 hook、扫现有 UI、注册 CDM 刷新；可多次调用以应对晚加载插件
 local function Bootstrap()
     RefreshIntegrations()
     HookTrackerFactory()
@@ -703,6 +753,7 @@ local function Bootstrap()
     RegisterRefreshCallback()
 end
 
+-- 事件驱动：登录时初始化；NDui/Masque/官方冷却监视器晚加载时再跑一次以接上库
 local driver = CreateFrame("Frame")
 driver:RegisterEvent("PLAYER_LOGIN")
 driver:RegisterEvent("ADDON_LOADED")
